@@ -292,38 +292,59 @@ def _get_cache_ttl() -> int:
     return int(os.environ.get("LIVEWEB_CACHE_TTL", str(DEFAULT_TTL)))
 
 
+def _is_file_cache_valid() -> bool:
+    """Check if homepage file cache exists and is within TTL."""
+    cache_file = _get_file_cache_path()
+    if not cache_file.exists():
+        return False
+    try:
+        cached = json.loads(cache_file.read_text())
+        if time.time() - cached.get("_fetched_at", 0) < _get_cache_ttl():
+            return bool(cached.get("assets"))
+    except Exception:
+        pass
+    return False
+
+
 def initialize_cache():
     """
     Pre-warm homepage file cache synchronously.
 
     Called by plugin.initialize() before evaluation starts (no timeout pressure).
-    If file cache is valid, this is a no-op. Otherwise fetches all homepage
-    symbols sequentially with rate limiting.
+    Uses file lock to prevent multiple instances from fetching simultaneously.
+    If file cache is valid, this is a no-op.
     """
-    cache_file = _get_file_cache_path()
-    ttl = _get_cache_ttl()
+    import fcntl
 
-    # Already cached and valid?
-    if cache_file.exists():
-        try:
-            cached = json.loads(cache_file.read_text())
-            if time.time() - cached.get("_fetched_at", 0) < ttl:
-                assets = cached.get("assets", {})
-                if assets:
-                    logger.info(f"Stooq init: {len(assets)} assets from file cache")
-                    return
-        except Exception:
-            pass
+    # Quick check without lock — avoids lock contention when cache is warm
+    if _is_file_cache_valid():
+        logger.info("Stooq init: homepage cache valid (quick check)")
+        return
 
-    # Fetch and cache
-    logger.info("Stooq init: pre-warming homepage cache...")
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            pool.submit(lambda: asyncio.run(fetch_homepage_api_data())).result()
-    else:
-        asyncio.run(fetch_homepage_api_data())
+    # Acquire file lock — only one process fetches, others wait
+    lock_path = _get_file_cache_path().with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(lock_path, "w")
+    try:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_EX)  # Blocking wait
+
+        # Re-check after acquiring lock — another process may have filled cache
+        if _is_file_cache_valid():
+            logger.info("Stooq init: homepage cache filled by another process")
+            return
+
+        # Fetch and cache
+        logger.info("Stooq init: pre-warming homepage cache...")
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                pool.submit(lambda: asyncio.run(fetch_homepage_api_data())).result()
+        else:
+            asyncio.run(fetch_homepage_api_data())
+    finally:
+        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+        fd.close()
 
 
 async def fetch_homepage_api_data() -> Dict[str, Any]:

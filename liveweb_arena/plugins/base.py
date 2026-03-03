@@ -134,6 +134,22 @@ class BasePlugin(ABC):
         """
         return normalize_url(url)
 
+    def get_synthetic_page(self, url: str) -> Optional[str]:
+        """
+        Return synthetic HTML for URLs that should never hit the real server.
+
+        Override to intercept requests for known-bad URLs (e.g., unknown symbols)
+        and return a synthetic error page instead of fetching from the live site.
+        This prevents wasted requests and potential IP bans.
+
+        Args:
+            url: The page URL
+
+        Returns:
+            HTML string if the page should be synthetic, None to fetch normally
+        """
+        return None
+
     def needs_api_data(self, url: str) -> bool:
         """
         Check if this URL needs API data for ground truth.

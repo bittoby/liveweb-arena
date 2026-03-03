@@ -2,7 +2,11 @@
 
 import asyncio
 import contextvars
+import json
 import logging
+import os
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -19,6 +23,20 @@ CACHE_SOURCE = "stooq"
 _rate_limited: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_stooq_rate_limited", default=False
 )
+
+# Negative cache: symbols that returned no data in this evaluation.
+# Prevents repeated API calls for symbols that are temporarily unavailable.
+_negative_cache: contextvars.ContextVar[Optional[set]] = contextvars.ContextVar(
+    "_stooq_negative_cache", default=None
+)
+
+
+def _get_negative_cache() -> set:
+    cache = _negative_cache.get()
+    if cache is None:
+        cache = set()
+        _negative_cache.set(cache)
+    return cache
 
 
 class StooqRateLimitError(Exception):
@@ -189,11 +207,10 @@ class StooqClient(BaseAPIClient):
 # ============================================================
 
 def _get_all_symbols() -> List[str]:
-    """Get all symbols that need to be cached."""
-    from .templates.variables import US_STOCKS, INDICES, CURRENCIES, COMMODITIES
+    """Homepage-visible symbols only (no US stocks — not shown on homepage)."""
+    from .templates.variables import INDICES, CURRENCIES, COMMODITIES
 
     symbols = []
-    symbols.extend(s.symbol for s in US_STOCKS)
     symbols.extend(s.symbol for s in INDICES)
     symbols.extend(s.symbol for s in CURRENCIES)
     symbols.extend(s.symbol for s in COMMODITIES)
@@ -264,23 +281,59 @@ async def fetch_cache_api_data() -> Optional[Dict[str, Any]]:
     return result
 
 
+def _get_file_cache_path() -> Path:
+    """Get path for stooq homepage file cache."""
+    cache_dir = os.environ.get("LIVEWEB_CACHE_DIR", "/var/lib/liveweb-arena/cache")
+    return Path(cache_dir) / "_plugin_init" / "stooq_homepage.json"
+
+
+def _get_cache_ttl() -> int:
+    """Get cache TTL from environment."""
+    from liveweb_arena.core.cache import DEFAULT_TTL
+    return int(os.environ.get("LIVEWEB_CACHE_TTL", str(DEFAULT_TTL)))
+
+
 async def fetch_homepage_api_data() -> Dict[str, Any]:
     """
     Fetch API data for Stooq homepage (all assets).
 
+    Uses file cache to avoid repeated CSV requests within TTL.
+
     Returns homepage format:
     {
         "assets": {
-            "aapl.us": {<price_data>},
             "gc.c": {<price_data>},
             ...
         }
     }
     """
+    # 1. Check file cache
+    cache_file = _get_file_cache_path()
+    ttl = _get_cache_ttl()
+    if cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text())
+            if time.time() - cached.get("_fetched_at", 0) < ttl:
+                assets = cached.get("assets", {})
+                if assets:
+                    logger.info(f"Stooq homepage: {len(assets)} assets from file cache")
+                    return {"assets": assets}
+        except Exception:
+            pass
+
+    # 2. Fetch from API
     data = await fetch_cache_api_data()
-    if data and data.get("assets"):
-        return {"assets": data["assets"]}
-    return {"assets": {}}
+    assets = data.get("assets", {}) if data else {}
+
+    # 3. Write file cache
+    if assets:
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps({"assets": assets, "_fetched_at": time.time()}))
+        except Exception:
+            pass
+
+    return {"assets": assets}
 
 
 async def fetch_single_asset_data(symbol: str) -> Optional[Dict[str, Any]]:
@@ -289,9 +342,14 @@ async def fetch_single_asset_data(symbol: str) -> Optional[Dict[str, Any]]:
 
     Tries the symbol as-is first, then with common suffixes (.us)
     since Stooq's CSV API requires suffixed symbols for some markets.
+    Uses negative cache to avoid repeated requests for symbols with no data.
     """
     if _rate_limited.get():
         raise StooqRateLimitError("Stooq API rate limited (persistent for this session)")
+
+    neg = _get_negative_cache()
+    if symbol in neg:
+        return {}
 
     # Try .us suffix first for bare symbols (canonical form for US stocks)
     variants = [symbol]
@@ -322,7 +380,11 @@ async def fetch_single_asset_data(symbol: str) -> Optional[Dict[str, Any]]:
                     if result:
                         return result
 
+        except StooqRateLimitError:
+            raise
         except Exception:
             continue
 
+    # All variants failed — add to negative cache
+    neg.add(symbol)
     return {}

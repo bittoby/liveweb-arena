@@ -2,6 +2,10 @@
 
 import asyncio
 import contextvars
+import json
+import os
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 import aiohttp
 
@@ -260,21 +264,47 @@ def _filter_by_emission(subnets: Dict[str, Any]) -> Dict[str, Any]:
     return filtered
 
 
+def _get_file_cache_path() -> Path:
+    """Get path for taostats subnet file cache."""
+    cache_dir = os.environ.get("LIVEWEB_CACHE_DIR", "/var/lib/liveweb-arena/cache")
+    return Path(cache_dir) / "_plugin_init" / "taostats_subnets.json"
+
+
+def _get_cache_ttl() -> int:
+    """Get cache TTL from environment."""
+    from liveweb_arena.core.cache import DEFAULT_TTL
+    return int(os.environ.get("LIVEWEB_CACHE_TTL", str(DEFAULT_TTL)))
+
+
 def initialize_cache():
     """
     Initialize subnet cache synchronously.
 
     Must be called before generating taostats questions.
-    Uses asyncio.run() to call async API.
+    Checks file cache first, falls back to API fetch.
     """
     if _subnet_cache.get() is not None:
         return  # Already initialized
 
+    # 1. Try file cache
+    cache_file = _get_file_cache_path()
+    ttl = _get_cache_ttl()
+    if cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text())
+            if time.time() - cached.get("_fetched_at", 0) < ttl:
+                subnets = cached.get("subnets", {})
+                if subnets:
+                    log("Taostats", f"Loaded {len(subnets)} subnets from file cache")
+                    _subnet_cache.set(_filter_by_emission(subnets))
+                    return
+        except Exception as e:
+            log("Taostats", f"File cache read failed (will fetch from API): {e}")
+
+    # 2. Fetch from API
     try:
-        # Try to get existing event loop
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            # If loop is running, create a new task
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 future = executor.submit(asyncio.run, fetch_all_subnets())
@@ -282,16 +312,26 @@ def initialize_cache():
         else:
             data = loop.run_until_complete(fetch_all_subnets())
     except APIFetchError:
-        raise  # API errors propagate directly
+        raise
     except RuntimeError as e:
-        # Only handle "no event loop" errors, re-raise others
         if "no current event loop" in str(e).lower() or "no running event loop" in str(e).lower():
             data = asyncio.run(fetch_all_subnets())
         else:
             raise
 
-    cache = data.get("subnets", {})
-    if not cache:
+    subnets = data.get("subnets", {})
+    if not subnets:
         raise APIFetchError("API returned no subnet data", source="taostats")
 
-    _subnet_cache.set(_filter_by_emission(cache))
+    # 3. Write back to file cache
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps({
+            "subnets": subnets,
+            "_fetched_at": time.time(),
+        }))
+        log("Taostats", f"Saved {len(subnets)} subnets to file cache")
+    except Exception:
+        pass
+
+    _subnet_cache.set(_filter_by_emission(subnets))

@@ -17,9 +17,11 @@ Directory structure:
                     └── .lock
 """
 
+import asyncio
 import fcntl
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -122,8 +124,6 @@ async def async_file_lock_acquire(lock_path: Path, timeout: float = 60.0) -> int
 
     This avoids blocking the event loop while waiting for the lock.
     """
-    import asyncio
-
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     start = time.time()
 
@@ -268,10 +268,48 @@ class CacheManager:
     - API data caching for ground truth validation
     """
 
-    def __init__(self, cache_dir: Path, ttl: int = DEFAULT_TTL):
+    # Minimum interval between consecutive cache-miss fetches (seconds)
+    _PREFETCH_INTERVAL = 1.0
+
+    def __init__(self, cache_dir: Path, ttl: int = None):
         self.cache_dir = Path(cache_dir)
+        if ttl is None:
+            ttl = int(os.environ.get("LIVEWEB_CACHE_TTL", str(DEFAULT_TTL)))
         self.ttl = ttl
+        self._playwright = None
         self._browser = None
+        self._browser_lock = asyncio.Lock()
+        self._last_fetch_time: float = 0
+
+    async def _ensure_browser(self):
+        """Ensure shared Playwright browser is running (lazy singleton)."""
+        if self._browser is not None:
+            return
+        async with self._browser_lock:
+            if self._browser is not None:
+                return
+            from playwright.async_api import async_playwright
+            from liveweb_arena.core.block_patterns import STEALTH_BROWSER_ARGS
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=True, args=STEALTH_BROWSER_ARGS,
+            )
+
+    async def shutdown(self):
+        """Shutdown shared browser and Playwright."""
+        async with self._browser_lock:
+            if self._browser:
+                try:
+                    await asyncio.wait_for(self._browser.close(), timeout=3)
+                except Exception:
+                    pass
+                self._browser = None
+            if self._playwright:
+                try:
+                    await asyncio.wait_for(self._playwright.stop(), timeout=3)
+                except Exception:
+                    pass
+                self._playwright = None
 
     async def ensure_cached(
         self,
@@ -328,14 +366,20 @@ class CacheManager:
 
             # 4. Actually fetch - page and API in parallel when possible
             log("Cache", f"MISS {page_type} - fetching {url_display(normalized)}")
-            start = time.time()
 
-            import asyncio as _asyncio
+            # Rate limit consecutive fetches to avoid triggering anti-bot
+            now = time.time()
+            wait = self._PREFETCH_INTERVAL - (now - self._last_fetch_time)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_fetch_time = time.time()
+
+            start = time.time()
 
             if need_api:
                 # Fetch HTML and API data concurrently
-                page_task = _asyncio.ensure_future(self._fetch_page(url, plugin))
-                api_task = _asyncio.ensure_future(plugin.fetch_api_data(url))
+                page_task = asyncio.ensure_future(self._fetch_page(url, plugin))
+                api_task = asyncio.ensure_future(plugin.fetch_api_data(url))
 
                 # Wait for both, collecting errors
                 page_result = None
@@ -448,7 +492,7 @@ class CacheManager:
 
     async def _fetch_page(self, url: str, plugin=None) -> tuple:
         """
-        Fetch page HTML and accessibility tree using Playwright.
+        Fetch page HTML and accessibility tree using shared Playwright browser.
 
         Args:
             url: Page URL to fetch
@@ -457,129 +501,131 @@ class CacheManager:
         Returns:
             (html, accessibility_tree) tuple
         """
-        from playwright.async_api import async_playwright
         from liveweb_arena.core.block_patterns import (
-            STEALTH_BROWSER_ARGS, STEALTH_INIT_SCRIPT, STEALTH_USER_AGENT,
+            STEALTH_INIT_SCRIPT, STEALTH_USER_AGENT,
             is_captcha_page, should_block_url,
         )
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=STEALTH_BROWSER_ARGS,
+        await self._ensure_browser()
+        try:
+            context = await self._browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                user_agent=STEALTH_USER_AGENT,
             )
-            try:
-                context = await browser.new_context(
-                    viewport={"width": 1280, "height": 720},
-                    user_agent=STEALTH_USER_AGENT,
-                )
-                page = await context.new_page()
-                await page.add_init_script(STEALTH_INIT_SCRIPT)
+        except Exception:
+            # Browser process may have crashed — clean up and retry once
+            await self.shutdown()
+            await self._ensure_browser()
+            context = await self._browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                user_agent=STEALTH_USER_AGENT,
+            )
+        try:
+            page = await context.new_page()
+            await page.add_init_script(STEALTH_INIT_SCRIPT)
 
-                # Block tracking/ads to avoid networkidle delays
-                # Merge global + plugin-specific block patterns
-                plugin_block_res = []
-                if plugin and hasattr(plugin, 'get_blocked_patterns'):
-                    for pat in plugin.get_blocked_patterns():
-                        regex_pat = re.escape(pat).replace(r"\*", ".*")
-                        plugin_block_res.append(re.compile(regex_pat, re.IGNORECASE))
+            # Block tracking/ads to avoid networkidle delays
+            # Merge global + plugin-specific block patterns
+            plugin_block_res = []
+            if plugin and hasattr(plugin, 'get_blocked_patterns'):
+                for pat in plugin.get_blocked_patterns():
+                    regex_pat = re.escape(pat).replace(r"\*", ".*")
+                    plugin_block_res.append(re.compile(regex_pat, re.IGNORECASE))
 
-                async def _block_tracking(route):
-                    req_url = route.request.url
-                    if should_block_url(req_url):
+            async def _block_tracking(route):
+                req_url = route.request.url
+                if should_block_url(req_url):
+                    await route.abort("blockedbyclient")
+                    return
+                for pat_re in plugin_block_res:
+                    if pat_re.search(req_url):
                         await route.abort("blockedbyclient")
                         return
-                    for pat_re in plugin_block_res:
-                        if pat_re.search(req_url):
-                            await route.abort("blockedbyclient")
-                            return
-                    await route.continue_()
+                await route.continue_()
 
-                await page.route("**/*", _block_tracking)
+            await page.route("**/*", _block_tracking)
 
-                response = await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+            response = await page.goto(url, timeout=60000, wait_until="domcontentloaded")
 
-                # Layer 1: HTTP status check
-                if response and response.status >= 400:
-                    raise CacheFatalError(
-                        f"HTTP {response.status} for {url}",
-                        url=url,
-                    )
+            # Layer 1: HTTP status check
+            if response and response.status >= 400:
+                raise CacheFatalError(
+                    f"HTTP {response.status} for {url}",
+                    url=url,
+                )
 
-                # Wait for network idle (short timeout: ads are blocked, so
-                # legitimate content loads in ~3-4s; streaming endpoints like
-                # aq*.stooq.com keep connections open indefinitely)
+            # Wait for network idle (short timeout: ads are blocked, so
+            # legitimate content loads in ~3-4s; streaming endpoints like
+            # aq*.stooq.com keep connections open indefinitely)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+
+            # Plugin-specific page setup (e.g., click "ALL" to show all rows)
+            if plugin and hasattr(plugin, 'setup_page_for_cache'):
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=5000)
-                except Exception:
-                    pass
+                    await plugin.setup_page_for_cache(page, url)
+                except Exception as e:
+                    log("Cache", f"Page setup failed (continuing): {e}")
 
-                # Plugin-specific page setup (e.g., click "ALL" to show all rows)
-                if plugin and hasattr(plugin, 'setup_page_for_cache'):
-                    try:
-                        await plugin.setup_page_for_cache(page, url)
-                    except Exception as e:
-                        log("Cache", f"Page setup failed (continuing): {e}")
+            # Scroll to trigger lazy loading
+            for pos in [0, 500, 1000, 2000]:
+                await page.evaluate(f"window.scrollTo(0, {pos})")
+                await page.wait_for_timeout(300)
 
-                # Scroll to trigger lazy loading
-                for pos in [0, 500, 1000, 2000]:
-                    await page.evaluate(f"window.scrollTo(0, {pos})")
-                    await page.wait_for_timeout(300)
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(500)
 
-                await page.evaluate("window.scrollTo(0, 0)")
-                await page.wait_for_timeout(500)
+            html = await page.content()
 
-                html = await page.content()
+            # Layer 2: CAPTCHA/challenge detection
+            page_title = await page.title()
+            if is_captcha_page(html, page_title):
+                raise CacheFatalError(
+                    f"CAPTCHA/challenge page detected (title: {page_title!r})",
+                    url=url,
+                )
 
-                # Layer 2: CAPTCHA/challenge detection
-                page_title = await page.title()
-                if is_captcha_page(html, page_title):
-                    raise CacheFatalError(
-                        f"CAPTCHA/challenge page detected (title: {page_title!r})",
-                        url=url,
-                    )
+            # Layer 3: Minimum content length (real pages are >5KB)
+            if len(html) < 1000:
+                raise CacheFatalError(
+                    f"Page too short ({len(html)} bytes, title: {page_title!r})",
+                    url=url,
+                )
 
-                # Layer 3: Minimum content length (real pages are >5KB)
-                if len(html) < 1000:
-                    raise CacheFatalError(
-                        f"Page too short ({len(html)} bytes, title: {page_title!r})",
-                        url=url,
-                    )
+            # Extract accessibility tree for deterministic caching
+            a11y_tree = ""
+            try:
+                a11y_snapshot = await page.accessibility.snapshot()
+                if a11y_snapshot:
+                    a11y_tree = self._format_accessibility_tree(a11y_snapshot)
+            except Exception:
+                pass
 
-                # Extract accessibility tree for deterministic caching
-                a11y_tree = ""
+            # If accessibility tree is empty, get page text content
+            if len(a11y_tree.strip()) < 100:
                 try:
-                    a11y_snapshot = await page.accessibility.snapshot()
-                    if a11y_snapshot:
-                        a11y_tree = self._format_accessibility_tree(a11y_snapshot)
-                except Exception:
-                    pass
-
-                # If accessibility tree is empty, get page text content
-                if len(a11y_tree.strip()) < 100:
-                    try:
-                        page_text = await page.evaluate("""
-                            () => {
-                                const preElements = document.querySelectorAll('pre');
-                                if (preElements.length > 0) {
-                                    return Array.from(preElements).map(el => el.innerText).join('\\n');
-                                }
-                                return document.body.innerText || '';
+                    page_text = await page.evaluate("""
+                        () => {
+                            const preElements = document.querySelectorAll('pre');
+                            if (preElements.length > 0) {
+                                return Array.from(preElements).map(el => el.innerText).join('\\n');
                             }
-                        """)
-                        if page_text.strip():
-                            if a11y_tree.strip():
-                                a11y_tree += "\n\n--- Page Text Content ---\n" + page_text
-                            else:
-                                a11y_tree = page_text
-                    except Exception:
-                        pass
+                            return document.body.innerText || '';
+                        }
+                    """)
+                    if page_text.strip():
+                        if a11y_tree.strip():
+                            a11y_tree += "\n\n--- Page Text Content ---\n" + page_text
+                        else:
+                            a11y_tree = page_text
+                except Exception:
+                    pass
 
-                await context.close()
-                return html, a11y_tree
-
-            finally:
-                await browser.close()
+            return html, a11y_tree
+        finally:
+            await context.close()
 
     def _format_accessibility_tree(self, node: dict, indent: int = 0) -> str:
         """Format accessibility tree node recursively."""

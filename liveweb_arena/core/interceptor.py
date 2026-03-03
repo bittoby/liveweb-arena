@@ -256,6 +256,22 @@ class CacheInterceptor:
         if self.cache_manager and self.plugin_resolver:
             plugin = self.plugin_resolver(url)
             if plugin:
+                # Synthetic page: serve directly without any network request.
+                # Used for unknown symbols / error pages to avoid hitting the server.
+                synthetic_html = plugin.get_synthetic_page(url)
+                if synthetic_html is not None:
+                    page = CachedPage(
+                        url=url, html=synthetic_html, api_data=None,
+                        accessibility_tree=None, fetched_at=0, need_api=False,
+                    )
+                    self.cached_pages[normalized] = page
+                    await route.fulfill(
+                        status=200,
+                        headers={"content-type": "text/html; charset=utf-8"},
+                        body=synthetic_html,
+                    )
+                    return
+
                 try:
                     need_api = plugin.needs_api_data(url)
                     page_req = PageRequirement.data(url) if need_api else PageRequirement.nav(url)

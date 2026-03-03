@@ -645,7 +645,9 @@ class Actor:
                 await self.browser.start()
 
     async def shutdown(self):
-        """Shutdown browser and cleanup resources."""
+        """Shutdown browser, cache manager, and cleanup resources."""
+        if self.cache_manager:
+            await self.cache_manager.shutdown()
         if self.browser:
             await self.browser.stop()
             self.browser = None

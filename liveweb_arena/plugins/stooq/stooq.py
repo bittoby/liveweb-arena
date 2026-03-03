@@ -4,8 +4,7 @@ Stooq Plugin.
 Plugin for financial market data from stooq.com.
 """
 
-import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
 from liveweb_arena.plugins.base import BasePlugin
@@ -27,6 +26,7 @@ class StooqPlugin(BasePlugin):
     """
 
     name = "stooq"
+    _known_symbols_cache = None
 
     allowed_domains = [
         "stooq.com",
@@ -40,12 +40,41 @@ class StooqPlugin(BasePlugin):
             "*stooq.com/ads/*",  # Ad frames
         ]
 
+    def get_synthetic_page(self, url: str) -> Optional[str]:
+        """Return synthetic error page for unknown symbols (zero network requests)."""
+        symbol = self._extract_symbol(url)
+        if symbol and symbol not in self._get_known_symbols():
+            return (
+                "<html><body>"
+                "<h1>The page you requested does not exist</h1>"
+                "<p>or has been moved</p>"
+                f"<p>Symbol: {symbol}</p>"
+                "</body></html>"
+            )
+        return None
+
+    def _get_known_symbols(self) -> set:
+        """All symbols defined in templates (cached at class level)."""
+        if StooqPlugin._known_symbols_cache is None:
+            from .templates.variables import US_STOCKS, INDICES, CURRENCIES, COMMODITIES
+            from .templates.sector_analysis import ALL_STOCKS, ALL_INDICES
+            symbols = set()
+            symbols.update(s.symbol for s in US_STOCKS)
+            symbols.update(s.symbol for s in INDICES)
+            symbols.update(s.symbol for s in CURRENCIES)
+            symbols.update(s.symbol for s in COMMODITIES)
+            symbols.update(sym for sym, _ in ALL_STOCKS)
+            symbols.update(sym for sym, _ in ALL_INDICES)
+            StooqPlugin._known_symbols_cache = symbols
+        return StooqPlugin._known_symbols_cache
+
     async def fetch_api_data(self, url: str) -> Dict[str, Any]:
         """
         Fetch API data for a Stooq page.
 
         - Homepage: Returns all assets in {"assets": {...}} format
-        - Detail page: Returns single asset data with "symbol" field
+        - Detail page (known symbol): Returns single asset data
+        - Detail page (unknown symbol): Returns {} — pure navigation
 
         Args:
             url: Page URL
@@ -53,9 +82,10 @@ class StooqPlugin(BasePlugin):
         Returns:
             API data appropriate for the page type
         """
-        # Check for detail page first
         symbol = self._extract_symbol(url)
         if symbol:
+            if symbol not in self._get_known_symbols():
+                return {}  # Unknown symbol — skip API, zero requests
             data = await fetch_single_asset_data(symbol)
             if not data:
                 raise ValueError(f"Stooq API returned no data for symbol={symbol}")
@@ -78,8 +108,8 @@ class StooqPlugin(BasePlugin):
         """
         Determine if this URL needs API data for ground truth.
 
-        Only homepage and asset detail pages can provide API data.
-        Other pages (q/d/, q/a/, etc.) are navigation-only.
+        Only homepage and known-symbol detail pages provide API data.
+        Unknown symbols are treated as pure navigation (no API call).
 
         Args:
             url: Page URL
@@ -87,13 +117,11 @@ class StooqPlugin(BasePlugin):
         Returns:
             True if API data is needed and available, False otherwise
         """
-        # Asset detail page needs API data
-        if self._extract_symbol(url):
-            return True
-        # Homepage needs API data
+        symbol = self._extract_symbol(url)
+        if symbol:
+            return symbol in self._get_known_symbols()
         if self._is_homepage(url):
             return True
-        # Other pages don't need API data
         return False
 
     def _extract_symbol(self, url: str) -> str:

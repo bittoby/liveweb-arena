@@ -204,16 +204,20 @@ class CacheInterceptor:
         except Exception as e:
             logger.error(f"Interceptor error for {url}: {e}")
             self.stats.errors += 1
-            # Fallback: let the request through to network instead of aborting.
-            # Aborting a click-initiated document navigation produces chrome-error://
-            # which the AI sees as "Page failed to load - network error".
+            # Never fall back to live network — that would silently break
+            # cache-mode determinism. Fulfill document requests with an error
+            # page (avoids chrome-error://); abort all other resource types.
             try:
-                await route.continue_()
-            except Exception:
-                try:
+                if resource_type == "document":
+                    await route.fulfill(
+                        status=500,
+                        headers={"content-type": "text/html"},
+                        body=f"<html><body><h1>Interceptor Error</h1><p>{e}</p></body></html>",
+                    )
+                else:
                     await route.abort("failed")
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
     async def _handle_document(self, route: Route, url: str):
         """Handle HTML document requests.

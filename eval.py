@@ -128,6 +128,14 @@ async def main():
         action="store_true",
         help="Use live mode (no caching, real-time web requests)",
     )
+    parser.add_argument(
+        "--protocol",
+        type=str,
+        choices=["legacy", "function_calling"],
+        default="legacy",
+        help="Agent interaction protocol (default: legacy). "
+             "'function_calling' uses OpenAI tool_calls format for standard training data.",
+    )
 
     args = parser.parse_args()
 
@@ -210,6 +218,7 @@ async def main():
             timeout=args.timeout,
             temperature=args.temperature,
             task_id=args.task_id,
+            protocol=args.protocol,
         )
 
         # Print results

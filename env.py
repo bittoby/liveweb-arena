@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Set
 from liveweb_arena.core.browser import BrowserEngine, BrowserSession
 from liveweb_arena.core.task_manager import TaskManager
 from liveweb_arena.core.agent_policy import AgentPolicy
+from liveweb_arena.core.agent_protocol import AgentProtocol, FunctionCallingProtocol
 from liveweb_arena.core.agent_loop import AgentLoop, BrowserFatalError
 from liveweb_arena.core.parser import AnswerParser
 from liveweb_arena.core.gt_collector import GTCollector, set_current_gt_collector
@@ -128,8 +129,8 @@ class EpisodeState:
     # GT collection state
     gt_collector: GTCollector
 
-    # Agent state
-    policy: AgentPolicy
+    # Agent state (supports both legacy AgentPolicy and new AgentProtocol)
+    policy: Any  # AgentPolicy | AgentProtocol
     system_prompt: str
 
     # Step tracking
@@ -210,10 +211,7 @@ class Actor:
                 plugins_used[subtask.plugin_name] = plugin
                 if hasattr(plugin, 'allowed_domains'):
                     allowed_domains.update(plugin.allowed_domains)
-                if hasattr(plugin, 'get_blocked_patterns'):
-                    blocked_patterns.extend(plugin.get_blocked_patterns())
-                elif hasattr(plugin, 'blocked_url_patterns'):
-                    blocked_patterns.extend(plugin.blocked_url_patterns)
+                blocked_patterns.extend(plugin.get_blocked_patterns())
                 if hasattr(plugin, 'clear_external_urls'):
                     plugin.clear_external_urls()
         return plugins_used, allowed_domains, list(set(blocked_patterns))
@@ -255,6 +253,7 @@ class Actor:
         temperature: float = 0.7,
         max_concurrency: int = 2,
         task_id: Optional[int] = None,
+        protocol: str = "legacy",
     ) -> dict:
         """
         Run a single evaluation.
@@ -316,6 +315,7 @@ class Actor:
                     timeout=timeout,
                     temperature=temperature,
                     task_id=task_id,
+                    protocol=protocol,
                 )
             except Exception as e:
                 import traceback
@@ -336,6 +336,12 @@ class Actor:
         result["time_taken"] = time.time() - start_time
         return result
 
+    def _create_protocol(self, protocol: str):
+        """Create agent protocol by name."""
+        if protocol == "function_calling":
+            return FunctionCallingProtocol()
+        return AgentPolicy()
+
     async def _run_evaluation(
         self,
         model: str,
@@ -348,6 +354,7 @@ class Actor:
         timeout: int,
         temperature: float,
         task_id: Optional[int] = None,
+        protocol: str = "legacy",
     ) -> dict:
         """Internal evaluation logic."""
         await self._ensure_browser()
@@ -417,10 +424,11 @@ class Actor:
                     interceptor, cached_pages, plugins_used, gt_collector, obs, self.use_cache,
                 )
 
+            active_protocol = self._create_protocol(protocol)
             agent_loop = AgentLoop(
                 session=session,
                 llm_client=llm_client,
-                policy=AgentPolicy(),
+                policy=active_protocol,
                 max_steps=effective_max_steps,
                 on_navigation=on_navigation,
                 on_observation=on_observation,
@@ -586,7 +594,7 @@ class Actor:
                 final_url = trajectory[-1].observation.url
 
             # Build conversation history
-            conversation = self._build_conversation(task, trajectory)
+            conversation = self._build_conversation(task, trajectory, active_protocol)
 
             result = {
                 "task_name": f"liveweb_arena:{num_subtasks}tasks",
@@ -656,13 +664,24 @@ class Actor:
         self,
         task,
         trajectory: List,
+        protocol=None,
     ) -> List[dict]:
-        """Build conversation history from task and trajectory."""
+        """Build conversation history from task and trajectory.
+
+        When a protocol with serialize_step() is provided, exports in that
+        protocol's native format (e.g., tool_calls for FunctionCallingProtocol).
+        Otherwise, uses the legacy user/assistant alternating format.
+        """
+        from liveweb_arena.core.agent_protocol import AgentProtocol
+
+        # Use protocol-native serialization if available
+        if protocol and isinstance(protocol, AgentProtocol):
+            return self._build_conversation_protocol(task, trajectory, protocol)
+
+        # Legacy format: alternating user/assistant text messages
         from liveweb_arena.core.agent_policy import AgentPolicy
 
         conversation = []
-
-        # Build system prompt
         policy = AgentPolicy()
         system_content = policy.build_system_prompt(task)
 
@@ -676,7 +695,6 @@ class Actor:
             }
         })
 
-        # Alternating user (environment) and assistant (agent) turns
         for step in trajectory:
             conversation.append({
                 "role": "user",
@@ -698,6 +716,27 @@ class Actor:
                     "action_result": step.action_result,
                 }
             })
+
+        return conversation
+
+    def _build_conversation_protocol(
+        self, task, trajectory: List, protocol,
+    ) -> List[dict]:
+        """Build conversation in protocol-native format (e.g., tool_calls)."""
+        conversation = []
+
+        system_content = protocol.build_system_prompt(task)
+        system_msg = {"role": "system", "content": system_content}
+
+        # Include tool definitions in the export for reproducibility
+        tools = protocol.get_tools()
+        if tools:
+            system_msg["tools"] = tools
+
+        conversation.append(system_msg)
+
+        for step in trajectory:
+            conversation.extend(protocol.serialize_step(step))
 
         return conversation
 

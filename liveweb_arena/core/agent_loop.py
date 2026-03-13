@@ -1,12 +1,13 @@
 """Agent loop for browser-based task execution"""
 
 import asyncio
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 from .browser import BrowserSession
 from .cache import CacheFatalError
 from .models import BrowserAction, CompositeTask, TrajectoryStep
 from .agent_policy import AgentPolicy
+from .agent_protocol import AgentProtocol
 from ..utils.llm_client import LLMClient, LLMFatalError
 from ..utils.logger import log
 
@@ -55,6 +56,10 @@ class AgentLoop:
     """
     Main agent loop that drives browser interaction via LLM.
 
+    Supports two interaction protocols:
+    - AgentPolicy (legacy): JSON-in-text format, uses chat()
+    - AgentProtocol with tools: Function calling format, uses chat_with_tools()
+
     The loop maintains trajectory state internally for partial recovery on timeout.
     """
 
@@ -62,7 +67,7 @@ class AgentLoop:
         self,
         session: BrowserSession,
         llm_client: LLMClient,
-        policy: AgentPolicy,
+        policy: Union[AgentPolicy, AgentProtocol],
         max_steps: int = 30,
         on_navigation: Optional[NavigationCallback] = None,
         on_step_complete: Optional[StepCompleteCallback] = None,
@@ -75,6 +80,9 @@ class AgentLoop:
         self._on_navigation = on_navigation
         self._on_step_complete = on_step_complete
         self._on_observation = on_observation
+
+        # Determine if protocol supports function calling
+        self._use_tools = isinstance(policy, AgentProtocol) and policy.get_tools() is not None
 
         # Internal state for partial recovery
         self._trajectory: List[TrajectoryStep] = []
@@ -92,6 +100,44 @@ class AgentLoop:
     def get_final_answer(self) -> Any:
         """Get final answer if available"""
         return self._final_answer
+
+    async def _call_llm(
+        self, system_prompt: str, user_prompt: str, model: str,
+        temperature: float, seed: Optional[int],
+    ) -> Tuple[str, Optional[BrowserAction], Optional[dict]]:
+        """
+        Call LLM using the appropriate protocol.
+
+        Returns:
+            Tuple of (raw_response, parsed_action_or_None, usage)
+        """
+        if self._use_tools:
+            tools = self._policy.get_tools()
+            response = await self._llm_client.chat_with_tools(
+                system=system_prompt,
+                user=user_prompt,
+                model=model,
+                tools=tools,
+                temperature=temperature,
+                seed=seed,
+            )
+            raw_response = response.content
+            if response.has_tool_calls:
+                # Build raw_response for logging: include tool call info
+                tc = response.tool_calls[0]
+                raw_response = raw_response or f"[tool_call: {tc.function['name']}({tc.function['arguments']})]"
+            action = self._policy.parse_response(raw_response, response.tool_calls)
+            return raw_response, action, response.usage
+        else:
+            raw_response, usage = await self._llm_client.chat(
+                system=system_prompt,
+                user=user_prompt,
+                model=model,
+                temperature=temperature,
+                seed=seed,
+            )
+            action = self._policy.parse_response(raw_response)
+            return raw_response, action, usage
 
     async def run(
         self,
@@ -123,7 +169,8 @@ class AgentLoop:
         self._parse_failed = False
 
         system_prompt = self._policy.build_system_prompt(task)
-        log("Agent", f"Starting loop, max_steps={self._max_steps}")
+        protocol_name = "function_calling" if self._use_tools else "legacy_text"
+        log("Agent", f"Starting loop, max_steps={self._max_steps}, protocol={protocol_name}")
 
         obs = await self._session.goto("about:blank")
         consecutive_errors = 0
@@ -185,12 +232,8 @@ class AgentLoop:
             )
 
             try:
-                raw_response, usage = await self._llm_client.chat(
-                    system=system_prompt,
-                    user=user_prompt,
-                    model=model,
-                    temperature=temperature,
-                    seed=seed,
+                raw_response, action, usage = await self._call_llm(
+                    system_prompt, user_prompt, model, temperature, seed,
                 )
                 if usage:
                     for key in self._total_usage:
@@ -212,8 +255,6 @@ class AgentLoop:
                 # Brief wait before retry
                 await asyncio.sleep(1)
                 continue
-
-            action = self._policy.parse_response(raw_response)
 
             # Parse failed - terminate immediately
             if action is None:
